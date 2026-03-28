@@ -1,0 +1,16 @@
+# Ambienti virtuali Python
+venv/
+env/
+
+# Cache di Python
+__pycache__/
+*.pyc
+
+# Cartelle di log e checkpoint di Ray RLlib
+ray_results/
+checkpoint_*/
+tmp*/
+*.json
+
+# File di sistema macOS (se usi Mac)
+.DS_Store
