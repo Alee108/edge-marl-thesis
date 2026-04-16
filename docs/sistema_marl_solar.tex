@@ -1,0 +1,365 @@
+\documentclass[11pt,a4paper]{article}
+
+% --- Pacchetti ---
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[italian]{babel}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{array}
+\usepackage{multirow}
+\usepackage{fancyhdr}
+\usepackage{xcolor}
+\usepackage{tabularx}
+
+\geometry{margin=2.5cm}
+\hypersetup{colorlinks=true, linkcolor=blue!60!black, urlcolor=blue!60!black}
+
+\pagestyle{fancy}
+\fancyhf{}
+\rhead{MARL Solar Edge -- Documento di Progetto}
+\lhead{Tesi Magistrale}
+\cfoot{\thepage}
+
+\title{\textbf{Sistema Multi-Agente per il Bilanciamento Energetico\\di un Cluster Edge con Energy Harvesting Fotovoltaico}\\[0.5em]\large Architettura, Modello e Metriche di Valutazione}
+\author{Alessandro Colantuoni}
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+% ======================================================================
+\section{Introduzione e Motivazione}
+% ======================================================================
+
+Il \emph{Multi-access Edge Computing} (MEC) avvicina le risorse computazionali ai dispositivi IoT, riducendo latenza e consumo di banda. In scenari outdoor (smart agriculture, monitoraggio ambientale, smart city), i nodi edge sono alimentati a batteria e dotati di pannelli fotovoltaici per l'\emph{Energy Harvesting}.
+
+Il problema centrale di questa tesi \`e il \textbf{Task Offloading} con vincoli energetici: dato un flusso continuo di task computazionali eterogenei, come distribuirli su un cluster di nodi edge in modo da:
+\begin{enumerate}[nosep]
+    \item Massimizzare il throughput (task completati localmente);
+    \item Mantenere bilanciata l'energia dell'intero cluster;
+    \item Sfruttare la \emph{Solar Wave}: il fatto che pannelli con orientamenti diversi ricevono picchi solari in momenti diversi della giornata.
+\end{enumerate}
+
+L'approccio adottato \`e il \textbf{Multi-Agent Reinforcement Learning (MARL)} con l'algoritmo \textbf{IPPO} (Independent Proximal Policy Optimization): ogni nodo possiede una policy neurale indipendente che impara autonomamente, senza comunicazione esplicita con gli altri nodi.
+
+% ======================================================================
+\section{Architettura del Sistema}
+% ======================================================================
+
+\subsection{Componenti Software}
+
+Il sistema \`e costruito su tre framework:
+\begin{itemize}[nosep]
+    \item \textbf{PettingZoo} (v1.24+): definisce l'ambiente multi-agente con API \texttt{ParallelEnv}, dove tutti gli agenti agiscono simultaneamente ad ogni step.
+    \item \textbf{Ray RLlib} (v2.x): orchestra il training distribuito. Ogni agente \`e mappato a una policy PPO indipendente tramite il \texttt{policy\_mapping\_fn}.
+    \item \textbf{Dati PVGIS}: profili di irradianza solare oraria reali per Roma (lat.\ 41.893, lon.\ 12.483), anno 2023, con risoluzione oraria (8760 punti/anno).
+\end{itemize}
+
+\subsection{Topologia del Cluster: 8 Nodi, 4 Orientamenti}
+
+Il cluster \`e composto da \textbf{8 nodi edge} organizzati in 4 coppie. Ogni coppia condivide lo stesso hardware \emph{e} lo stesso orientamento del pannello solare. Il mapping \`e progettato per \textbf{bilanciare} le capacit\`a hardware con la disponibilit\`a solare:
+
+\begin{table}[h]
+\centering
+\caption{Mapping Nodi--Hardware--Orientamento}
+\label{tab:mapping}
+\begin{tabular}{@{}cccccc@{}}
+\toprule
+\textbf{Nodi} & \textbf{Hardware} & $P_{\text{compl}}$ & $B_{\max}$ (Wh) & \textbf{Orientamento} & \textbf{Logica} \\
+\midrule
+$W_0, W_1$ & Jetson Orin   & 0.95 & 10.0 & Nord  & Grande batteria compensa poco sole \\
+$W_2, W_3$ & Jetson Nano   & 0.80 & 8.0  & Ovest & Sole pomeridiano \\
+$W_4, W_5$ & Raspberry Pi  & 0.65 & 7.0  & Est   & Sole mattutino \\
+$W_6, W_7$ & Low-power MCU & 0.50 & 5.0  & Sud   & Molto sole compensa batteria piccola \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+La scelta di assegnare i nodi pi\`u deboli (batteria da 5\,Wh) all'esposizione pi\`u favorevole (Sud) e i nodi pi\`u potenti (batteria da 10\,Wh) all'esposizione peggiore (Nord) crea un sistema intrinsecamente bilanciato, dove nessuna coppia ha un vantaggio strutturale dominante.
+
+% ======================================================================
+\section{Modello dell'Ambiente}
+% ======================================================================
+
+\subsection{Spazio delle Osservazioni}
+
+Ogni agente $i$ riceve ad ogni step $t$ un vettore di osservazione a 5 dimensioni:
+
+\begin{equation}
+\mathbf{o}_i^{(t)} = \Big[\; \underbrace{\tau^{(t)}}_{\text{tipo task}},\;\; \underbrace{q_i^{(t)}}_{\text{coda locale}},\;\; \underbrace{\hat{b}_i^{(t)}}_{\text{batteria norm.}},\;\; \underbrace{\bar{b}^{(t)}}_{\text{media cluster}},\;\; \underbrace{s_i^{(t)}}_{\text{sole attuale}} \;\Big]
+\label{eq:obs}
+\end{equation}
+
+dove:
+\begin{itemize}[nosep]
+    \item $\tau^{(t)} \in \{0, 1, 2\}$: tipo del task in arrivo (60fps, 30fps, 15fps);
+    \item $q_i^{(t)} \in \{0, \ldots, K\}$: lunghezza della coda locale ($K=5$);
+    \item $\hat{b}_i^{(t)} = b_i^{(t)} / B_i^{\max} \in [0, 1]$: batteria normalizzata;
+    \item $\bar{b}^{(t)} = \frac{1}{N}\sum_{j=1}^{N} \hat{b}_j^{(t)}$: media delle batterie normalizzate del cluster;
+    \item $s_i^{(t)} \in [0, 1]$: irradianza solare normalizzata per l'orientamento del nodo $i$ all'istante $t$.
+\end{itemize}
+
+\textbf{Nota chiave}: l'agente vede sia la propria batteria $\hat{b}_i$ sia la media del cluster $\bar{b}$. Questo gli fornisce il segnale per capire se \`e \emph{sopra} o \emph{sotto} la media, senza necessitare di comunicazione esplicita.
+
+\subsection{Spazio delle Azioni}
+
+Lo spazio delle azioni \`e \textbf{discreto binario}:
+\begin{equation}
+a_i^{(t)} \in \{0, 1\} \quad \text{dove} \quad
+\begin{cases}
+0 & \text{Rifiuta il task} \\
+1 & \text{Accetta il task (volontariato)}
+\end{cases}
+\end{equation}
+
+\subsection{Logica del Dispatcher}
+
+Quando pi\`u agenti scelgono $a_i = 1$ (volontari), il \textbf{dispatcher} assegna il task secondo questa logica:
+\begin{enumerate}[nosep]
+    \item Seleziona i volontari con la coda pi\`u corta: $\mathcal{V}^* = \arg\min_{j \in \mathcal{V}} q_j$;
+    \item In caso di parit\`a, sceglie casualmente tra i candidati;
+    \item Se la coda del selezionato \`e piena ($q_j = K$), il task viene \textbf{rifiutato};
+    \item Se nessuno si offre volontario e il cloud \`e disponibile, il task va al \textbf{cloud}; altrimenti viene \textbf{rifiutato}.
+\end{enumerate}
+
+\subsection{Dinamica della Batteria}
+
+Ad ogni step, la batteria di ogni nodo $i$ si aggiorna secondo:
+
+\begin{equation}
+b_i^{(t+1)} = \min\!\Big(\; B_i^{\max},\;\; b_i^{(t)} - c_{\text{idle}} - c_{\text{work}} \cdot \mathbb{1}[\text{task completato}] + s_i^{(t)} \cdot R_{\max} \;\Big)
+\label{eq:battery}
+\end{equation}
+
+dove:
+\begin{itemize}[nosep]
+    \item $c_{\text{idle}} = 0.001$\,Wh: consumo base per step (sempre presente);
+    \item $c_{\text{work}} = 0.05$\,Wh: consumo aggiuntivo per completamento task;
+    \item $R_{\max} = 0.06$\,Wh: ricarica massima per step a pieno sole;
+    \item $\mathbb{1}[\text{task completato}]$: indicatore stocastico, dipende da $P_{\text{compl},i}$.
+\end{itemize}
+
+Il completamento del task \`e stocastico: ad ogni step, se la coda \`e non vuota, il task viene completato con probabilit\`a $P_{\text{compl},i}$ (la velocit\`a del nodo dalla Tabella~\ref{tab:mapping}).
+
+\textbf{Bilancio energetico}: a pieno sole ($s_i = 1$), un nodo che lavora consuma $0.05 + 0.001 = 0.051$\,Wh e ricarica $0.06$\,Wh, con un guadagno netto di $+0.009$\,Wh/step. Un nodo idle a pieno sole guadagna $0.06 - 0.001 = +0.059$\,Wh/step. Di notte ($s_i = 0$), il nodo perde $0.001$\,Wh/step in idle e $0.051$\,Wh/step se lavora.
+
+% ======================================================================
+\section{Dati Solari}
+% ======================================================================
+
+\subsection{Fonte e Formato}
+
+I profili solari provengono dal database \textbf{PVGIS-SARAH3} (Photovoltaic Geographical Information System) della Commissione Europea. Parametri della query:
+\begin{itemize}[nosep]
+    \item Localit\`a: Roma (41.893\textdegree N, 12.483\textdegree E), elevazione 42\,m;
+    \item Inclinazione pannello: 30\textdegree;
+    \item Tecnologia: Silicio cristallino (c-Si), 1\,kWp nominale;
+    \item Perdite di sistema: 14\%;
+    \item 4 azimut: Sud (0\textdegree), Est ($-90$\textdegree), Ovest ($+90$\textdegree), Nord ($-179$\textdegree).
+\end{itemize}
+
+Ogni file CSV contiene 8760 valori orari della potenza $P$ (W) prodotta dal pannello per l'intero anno 2023.
+
+\subsection{Normalizzazione}
+
+La potenza \`e normalizzata dinamicamente rispetto al picco massimo presente nei dati:
+\begin{equation}
+s_{\text{orient}}^{(t)} = \text{clip}\!\left(\frac{P_{\text{orient}}^{(t)}}{P_{\max}},\; 0,\; 1\right), \quad P_{\max} = \max_{\text{orient}, t}\; P_{\text{orient}}^{(t)}
+\end{equation}
+
+Questo garantisce che il range $[0, 1]$ dell'observation space sia pienamente utilizzato.
+
+\subsection{Data Augmentation (Solo Training)}
+
+Durante il training, ogni episodio applica un fattore di augmentation $\xi \sim \mathcal{U}(0.5, 1.0)$ che moltiplica tutti i valori solari:
+\begin{equation}
+\tilde{s}_i^{(t)} = s_i^{(t)} \cdot \xi
+\end{equation}
+
+Questo simula condizioni meteo variabili (nuvolosit\`a parziale), rendendo la policy robusta a giornate con irradianza ridotta rispetto ai dati storici. In fase di valutazione, $\xi = 1$ (dati reali non alterati).
+
+% ======================================================================
+\section{Funzione di Reward}
+% ======================================================================
+
+La reward \`e \textbf{per-agente} (ogni nodo riceve una reward potenzialmente diversa) e si compone di due termini bilanciati dal parametro $\alpha = 0.5$:
+
+\begin{equation}
+r_i^{(t)} = \alpha \cdot r_{\text{fps}}^{(t)} + (1 - \alpha) \cdot r_{\text{batt},i}^{(t)}
+\label{eq:reward}
+\end{equation}
+
+\subsection{Componente Prestazionale $r_{\text{fps}}$ (Condivisa)}
+
+Questa componente \`e identica per tutti gli agenti e premia/penalizza l'esito del task:
+
+\begin{equation}
+r_{\text{fps}} =
+\begin{cases}
+-2.0 & \text{task rifiutato (perso per il sistema)} \\
+-1.5 & \text{task al cloud, ma c'era spazio edge} \\
++0.5 & \text{task al cloud, edge pieno (salvavita)} \\
++0.1 & \text{task edge tipo 0 (leggero)} \\
++1.0 & \text{task edge tipo 1 (medio)} \\
++2.0 & \text{task edge tipo 2 (pesante)}
+\end{cases}
+\end{equation}
+
+\subsection{Componente Energetica $r_{\text{batt},i}$ (Individuale)}
+
+Questa componente contiene tre sotto-termini che risolvono il problema del \emph{credit assignment}:
+
+\paragraph{(a) Penalit\`a sulla Varianza (condivisa).} Quando un task viene accettato sull'edge:
+\begin{equation}
+r_{\text{var}} = -20 \cdot \text{Var}\!\left(\hat{b}_1, \ldots, \hat{b}_N\right) = -20 \cdot \frac{1}{N}\sum_{j=1}^{N}\left(\hat{b}_j - \bar{b}\right)^2
+\end{equation}
+
+Questo termine \`e il cuore del bilanciamento: qualsiasi azione che aumenta la dispersione delle batterie normalizzate viene penalizzata.
+
+\paragraph{(b) Deviazione Individuale.} Penalizza specificamente l'agente $i$ per quanto si discosta dalla media:
+\begin{equation}
+r_{\text{dev},i} = -5 \cdot \left|\hat{b}_i - \bar{b}\right|
+\end{equation}
+
+Questo termine risolve il credit assignment: un agente con batteria molto diversa dalla media riceve una penalità maggiore, indipendentemente dalle azioni degli altri.
+
+\paragraph{(c) Anti-Laziness.} Penalizza gli agenti che rifiutano il task ($a_i = 0$) pur avendo batteria sopra la media \emph{e} sole disponibile:
+\begin{equation}
+r_{\text{lazy},i} =
+\begin{cases}
+-0.5 \cdot s_i^{(t)} & \text{se } a_i = 0,\;\; \hat{b}_i > \bar{b},\;\; s_i^{(t)} > 0.2,\;\; \text{task non rifiutato} \\
+0 & \text{altrimenti}
+\end{cases}
+\end{equation}
+
+La combinazione per un task accettato sull'edge \`e quindi:
+\begin{equation}
+r_{\text{batt},i} = r_{\text{var}} + r_{\text{dev},i} + r_{\text{lazy},i}
+\end{equation}
+
+Quando il task \`e rifiutato o inviato al cloud, $r_{\text{batt},i}$ usa penalità fisse basate sul tipo di task (da 0.0 a $-0.4$), pi\`u l'eventuale termine anti-laziness.
+
+% ======================================================================
+\section{Training IPPO}
+% ======================================================================
+
+\subsection{Paradigma: Independent PPO}
+
+Ogni nodo $W_i$ possiede una \textbf{policy neurale indipendente} $\pi_{\theta_i}$. Non c'\`e condivisione di pesi, comunicazione tra agenti, o critic centralizzato. Ogni policy \`e una rete neurale standard di PPO che mappa osservazioni locali $\mathbf{o}_i$ in una distribuzione sull'azione $a_i$.
+
+Le 8 policy vengono addestrate \textbf{simultaneamente} nello stesso ambiente: ad ogni step, ciascuna osserva il proprio stato, decide, e riceve la propria reward. L'ambiente funge da unico canale di coordinamento implicito (attraverso $\bar{b}$ e la varianza).
+
+\subsection{Iperparametri}
+
+\begin{table}[h]
+\centering
+\caption{Configurazione PPO}
+\label{tab:hyperparams}
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Parametro} & \textbf{Valore} \\
+\midrule
+Algoritmo & PPO (via Ray RLlib) \\
+Discount factor $\gamma$ & 0.99 \\
+Learning rate & $5 \times 10^{-4}$ \\
+Train batch size & 8000 \\
+Minibatch size & 256 \\
+Num.\ env runners & 1 \\
+Iterazioni totali & 1000 \\
+Durata episodio & 10000 step (max) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Strategie di Robustezza}
+
+Per evitare che la policy memorizzi pattern specifici del dataset:
+
+\begin{enumerate}[nosep]
+    \item \textbf{Punto di partenza casuale}: ad ogni reset, il \texttt{weather\_step} iniziale \`e campionato uniformemente nell'anno, evitando che tutti gli episodi inizino da gennaio.
+    \item \textbf{Batterie casuali}: in training, le batterie iniziali sono campionate da $\mathcal{U}(0.4, 1.0) \cdot B_i^{\max}$, forzando la policy a gestire scenari di batteria bassa.
+    \item \textbf{Augmentation solare}: il fattore $\xi \sim \mathcal{U}(0.5, 1.0)$ riduce stocasticamente l'irradianza, simulando giornate nuvolose non presenti nei dati storici.
+\end{enumerate}
+
+% ======================================================================
+\section{Comportamento Atteso: la Solar Wave}
+% ======================================================================
+
+Il comportamento emergente desiderato \`e il \textbf{Load Shifting guidato dal sole}:
+
+\begin{enumerate}[nosep]
+    \item \textbf{Mattina} (ore 6--12): i nodi Est ($W_4, W_5$) ricevono il picco solare. Dovrebbero accettare pi\`u task, sfruttando la ricarica per compensare il consumo.
+    \item \textbf{Mezzogiorno} (ore 11--15): i nodi Sud ($W_6, W_7$) raggiungono il picco. Nonostante l'hardware debole, il sole abbondante consente loro di lavorare attivamente.
+    \item \textbf{Pomeriggio} (ore 13--18): i nodi Ovest ($W_2, W_3$) entrano nel loro picco. Il carico si sposta su di essi.
+    \item \textbf{Notte} (ore 18--6): tutti i nodi riducono l'accettazione al minimo. I nodi Nord ($W_0, W_1$), con batterie grandi, possono gestire i pochi task notturni essenziali.
+\end{enumerate}
+
+Questo comportamento non \`e programmato esplicitamente, ma dovrebbe \textbf{emergere} dall'interazione tra:
+\begin{itemize}[nosep]
+    \item L'osservazione del sole locale $s_i^{(t)}$ (l'agente sa quanto sole ha);
+    \item La penalità sulla varianza (accettare senza sole scarica la batteria e aumenta la varianza);
+    \item Il termine anti-laziness (rifiutare con sole e batteria alta viene penalizzato);
+    \item La deviazione individuale (chi si allontana dalla media viene penalizzato di pi\`u).
+\end{itemize}
+
+% ======================================================================
+\section{Metriche di Valutazione}
+% ======================================================================
+
+La valutazione del sistema addestrato avviene in modalit\`a deterministica (\texttt{explore=False}), con batterie inizializzate al 100\% e dati solari reali ($\xi = 1$). Le metriche chiave sono:
+
+\subsection{Varianza Energetica del Cluster}
+
+\begin{equation}
+V^{(t)} = \text{Var}\!\left(\hat{b}_1^{(t)}, \ldots, \hat{b}_N^{(t)}\right)
+\end{equation}
+
+Tracciata nel tempo, indica quanto il sistema riesce a mantenere bilanciate le batterie. Il target ideale \`e $V^{(t)} \approx 0$ per tutta la simulazione.
+
+\subsection{Task Rifiutati}
+
+Il conteggio totale dei task rifiutati durante la simulazione. Un sistema ben addestrato dovrebbe minimizzare i rifiuti, accettando i task sui nodi con pi\`u energia disponibile.
+
+\subsection{Profili di Batteria}
+
+I livelli di batteria normalizzati di tutti gli 8 nodi, tracciati nel tempo. Il comportamento atteso \`e un andamento ``a onda'': i nodi con sole si caricano mentre lavorano, i nodi senza sole si scaricano lentamente in idle, con le curve che si avvicinano e si allontanano seguendo il ciclo solare.
+
+\subsection{Lunghezza Media delle Code}
+
+La media delle code di tutti i nodi, tracciata nel tempo. Indica l'efficienza di smaltimento dei task e la distribuzione del carico.
+
+\subsection{Protocollo di Test}
+
+\begin{enumerate}[nosep]
+    \item Simulazione di \textbf{168 step} (1 settimana) a partire da un seed fisso (\texttt{seed=42}) per riproducibilit\`a;
+    \item Generazione di 3 grafici: (1) Batterie degli 8 nodi, (2) Varianza di sistema, (3) Code medie + task rifiutati;
+    \item Confronto qualitativo con una \textbf{Random Policy} (baseline) per dimostrare che il training ha prodotto un comportamento intelligente.
+\end{enumerate}
+
+% ======================================================================
+\section{Riepilogo dei File del Progetto}
+% ======================================================================
+
+\begin{table}[h]
+\centering
+\caption{Struttura del progetto}
+\begin{tabularx}{\textwidth}{@{}lX@{}}
+\toprule
+\textbf{File} & \textbf{Descrizione} \\
+\midrule
+\texttt{config.py} & Parametri globali: hardware, batterie, velocit\`a, iperparametri RL \\
+\texttt{env/solar\_edge\_env.py} & Ambiente PettingZoo con dinamica batterie, ricarica solare, reward per-agente \\
+\texttt{train\_solar\_ippo.py} & Script di training: configura RLlib, definisce 8 policy indipendenti, lancia PPO \\
+\texttt{evaluate\_solar\_model.py} & Valutazione post-training: simulazione deterministica + generazione grafici \\
+\texttt{solar\_data/*.csv} & 4 profili PVGIS (Sud, Est, Ovest, Nord) con 8760 valori orari ciascuno \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\end{document}
